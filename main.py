@@ -1,24 +1,31 @@
+import os
+import time
+import json
+import warnings
+from datetime import datetime, time as dtime
+
 import yfinance as yf
 import pandas as pd
 import requests
 import mplfinance as mpf
-import json
-import os
-import time
 import urllib3
-import warnings
-from datetime import datetime, time as dtime
 
 warnings.filterwarnings("ignore")
 urllib3.disable_warnings()
 
-# ===== Telegram 設定 =====
-BOT_TOKEN = "8697923275:AAE_fft87jcIRMwFu6tDnZeZ4gq-nk-ecJ8"
-CHAT_ID = "5715057919"
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+CHAT_ID = os.getenv("CHAT_ID")
 
 NOTIFIED_FILE = "notified_final.json"
 
-# ===== 你的股票 / 持股 / 關注股 =====
+SCAN_INTERVAL_SECONDS = 300
+MARKET_START = dtime(9, 0)
+MARKET_END = dtime(13, 35)
+
+SCAN_ALL_MARKET = True
+MAX_SCAN_STOCKS = 300
+MAX_PUSH_SIGNALS = 5
+
 my_stocks = [
     "2330.TW",
     "3023.TW",
@@ -28,14 +35,6 @@ my_stocks = [
     "00878.TW",
     "00981A.TW"
 ]
-
-# ===== 盤中掃描設定 =====
-SCAN_INTERVAL_SECONDS = 300  # 5分鐘
-MARKET_START = dtime(9, 0)
-MARKET_END = dtime(13, 35)
-
-# True = 掃全市場，會比較久
-SCAN_ALL_MARKET = True
 
 
 def send_message(message):
@@ -55,8 +54,7 @@ def send_photo(message, image):
 
 def get_updates(offset=None):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates"
-    params = {"timeout": 10, "offset": offset}
-    return requests.get(url, params=params).json()
+    return requests.get(url, params={"timeout": 10, "offset": offset}).json()
 
 
 def load_notified():
@@ -104,14 +102,8 @@ def get_all_tw_stocks():
     stock_list = []
 
     markets = [
-        {
-            "url": "https://isin.twse.com.tw/isin/C_public.jsp?strMode=2",
-            "suffix": ".TW"
-        },
-        {
-            "url": "https://isin.twse.com.tw/isin/C_public.jsp?strMode=4",
-            "suffix": ".TWO"
-        }
+        {"url": "https://isin.twse.com.tw/isin/C_public.jsp?strMode=2", "suffix": ".TW"},
+        {"url": "https://isin.twse.com.tw/isin/C_public.jsp?strMode=4", "suffix": ".TWO"}
     ]
 
     headers = {"User-Agent": "Mozilla/5.0"}
@@ -142,14 +134,7 @@ def get_all_tw_stocks():
 
 
 def analyze_daily(symbol):
-    df = yf.download(
-        symbol,
-        period="6mo",
-        interval="1d",
-        progress=False,
-        auto_adjust=False
-    )
-
+    df = yf.download(symbol, period="6mo", interval="1d", progress=False, auto_adjust=False)
     df = fix_df(df)
 
     if df.empty or len(df) < 60:
@@ -193,13 +178,13 @@ def analyze_daily(symbol):
     target = close + risk * 2
 
     if score >= 80:
-        status = "偏強，有機會發動🔥"
+        status = "偏強，可以觀察買點🔥"
     elif score >= 60:
-        status = "整理偏強，觀察突破"
+        status = "整理偏強，等突破或拉回"
     elif score >= 40:
         status = "普通，先觀察"
     else:
-        status = "偏弱，不急"
+        status = "偏弱，不建議買"
 
     return {
         "symbol": symbol,
@@ -217,14 +202,7 @@ def analyze_daily(symbol):
 
 
 def analyze_intraday(symbol):
-    df = yf.download(
-        symbol,
-        period="5d",
-        interval="5m",
-        progress=False,
-        auto_adjust=False
-    )
-
+    df = yf.download(symbol, period="5d", interval="5m", progress=False, auto_adjust=False)
     df = fix_df(df)
 
     if df.empty or len(df) < 80:
@@ -257,7 +235,7 @@ def analyze_intraday(symbol):
     first_break = breakout and get_value(prev, "Close") <= get_value(prev, "HIGH20")
     volume_strong = volume > vol20 * 1.8
     strong_candle = close > open_price and close >= high * 0.97
-    not_too_far = close <= ema20 * 1.05
+    not_too_high = close <= ema20 * 1.05
 
     score = 0
     if trend:
@@ -268,10 +246,10 @@ def analyze_intraday(symbol):
         score += 25
     if strong_candle:
         score += 10
-    if not_too_far:
+    if not_too_high:
         score += 10
 
-    is_signal = trend and breakout and first_break and volume_strong and strong_candle and not_too_far
+    is_signal = trend and breakout and first_break and volume_strong and strong_candle and not_too_high
 
     stop_loss = min(ema20, low10)
     risk = close - stop_loss
@@ -291,15 +269,91 @@ def analyze_intraday(symbol):
     }
 
 
-def plot_chart(symbol, info):
-    df = yf.download(
-        symbol,
-        period="2d",
-        interval="5m",
-        progress=False,
-        auto_adjust=False
+def buy_advice(r):
+    close = r["close"]
+    score = r["score"]
+    high20 = r["high20"]
+    stop_loss = r["stop_loss"]
+    target = r["target"]
+    ema20 = r.get("ema20")
+
+    if score >= 80 and close > high20:
+        return (
+            f"✅ 建議：可以小量試單\n"
+            f"進場：現價附近，或回測突破價 {high20} 不破再買\n"
+            f"加碼：站穩突破價且量能續強\n"
+            f"停損：跌破 {stop_loss}\n"
+            f"出場：到 {target} 可分批賣，或跌破 EMA20 {ema20} 出場"
+        )
+
+    if score >= 60:
+        return (
+            f"🟡 建議：先觀察，不急追\n"
+            f"進場：等突破 {high20}，或拉回 EMA20 {ema20} 附近轉強再買\n"
+            f"停損：跌破 {stop_loss}\n"
+            f"出場：到 {target} 可分批賣，或跌破 EMA20 {ema20} 出場"
+        )
+
+    return (
+        f"❌ 建議：目前不建議買\n"
+        f"進場：等重新站上 {high20} 且放量再考慮\n"
+        f"停損：若已持有，跌破 {stop_loss} 要小心\n"
+        f"出場：弱勢股不要攤平，等轉強再看"
     )
 
+
+def plot_chart(symbol, info):
+    df = yf.download(symbol, period="3mo", interval="1d", progress=False, auto_adjust=False)
+    df = fix_df(df)
+
+    if df.empty or len(df) < 30:
+        return None
+
+    df["EMA5"] = df["Close"].ewm(span=5).mean()
+    df["EMA20"] = df["Close"].ewm(span=20).mean()
+    df["EMA60"] = df["Close"].ewm(span=60).mean()
+    df["HIGH20"] = df["High"].shift(1).rolling(20).max()
+
+    buy_marker = [float("nan")] * len(df)
+    buy_marker[-1] = float(df["Low"].iloc[-1]) * 0.98
+
+    add_plots = [
+        mpf.make_addplot(df["EMA5"], color="blue", width=1),
+        mpf.make_addplot(df["EMA20"], color="purple", width=1),
+        mpf.make_addplot(df["EMA60"], color="orange", width=1),
+        mpf.make_addplot(df["HIGH20"], color="red", width=1),
+        mpf.make_addplot(
+            buy_marker,
+            type="scatter",
+            marker="^",
+            markersize=180,
+            color="green"
+        )
+    ]
+
+    file_name = f"{symbol.replace('.', '_')}_chart.png"
+
+    mpf.plot(
+        df,
+        type="candle",
+        style="yahoo",
+        volume=True,
+        addplot=add_plots,
+        hlines=dict(
+            hlines=[info["high20"], info["stop_loss"], info["target"]],
+            colors=["red", "black", "green"],
+            linestyle="--",
+            linewidths=1
+        ),
+        title=f"{symbol} 進出場圖",
+        savefig=file_name
+    )
+
+    return file_name
+
+
+def plot_intraday_chart(symbol, info):
+    df = yf.download(symbol, period="2d", interval="5m", progress=False, auto_adjust=False)
     df = fix_df(df)
 
     if df.empty or len(df) < 30:
@@ -325,7 +379,7 @@ def plot_chart(symbol, info):
         )
     ]
 
-    file_name = f"{symbol.replace('.', '_')}_chart.png"
+    file_name = f"{symbol.replace('.', '_')}_intraday_chart.png"
 
     mpf.plot(
         df,
@@ -339,7 +393,7 @@ def plot_chart(symbol, info):
             linestyle="--",
             linewidths=1
         ),
-        title=f"{symbol} 5分K 買點圖",
+        title=f"{symbol} 5分K 盤中買點圖",
         savefig=file_name
     )
 
@@ -355,39 +409,13 @@ def format_intraday_signal(r):
         f"量能：{r['volume_rate']}倍\n"
         f"突破價：{r['high20']}\n"
         f"EMA5 / EMA20：{r['ema5']} / {r['ema20']}\n"
-        f"參考停損：{r['stop_loss']}\n"
-        f"參考目標：{r['target']}\n\n"
-        f"綠箭頭＝買點\n"
-        f"紅線＝突破前高\n"
-        f"黑線＝停損\n"
-        f"綠線＝目標"
+        f"停損：{r['stop_loss']}\n"
+        f"目標：{r['target']}\n\n"
+        f"{buy_advice(r)}\n\n"
+        f"圖表：綠箭頭=買點｜紅線=突破｜黑線=停損｜綠線=目標"
     )
 
-def buy_advice(r):
-    close = r["close"]
-    score = r["score"]
-    high20 = r["high20"]
-    ema20 = r.get("ema20", None)
-    stop_loss = r["stop_loss"]
 
-    if score >= 80 and close > high20:
-        advice = "可以小量試單，屬於突破買點🔥"
-        buy_zone = f"現價附近或回測突破價 {high20}"
-    elif score >= 60:
-        advice = "可以觀察，不建議急追"
-        buy_zone = f"等拉回 EMA20 附近 {ema20}，或突破 {high20} 再買"
-    elif score >= 40:
-        advice = "暫時不建議買，等型態轉強"
-        buy_zone = f"等站上突破價 {high20}"
-    else:
-        advice = "不建議買，趨勢偏弱"
-        buy_zone = "先不要進場"
-
-    return (
-        f"建議：{advice}\n"
-        f"買點：{buy_zone}\n"
-        f"停損：跌破 {stop_loss} 要小心"
-    )
 def format_daily_analysis(r):
     return (
         f"📊 股票分析：{r['symbol']}\n\n"
@@ -398,7 +426,10 @@ def format_daily_analysis(r):
         f"EMA5/20/60：{r['ema5']} / {r['ema20']} / {r['ema60']}\n"
         f"停損：{r['stop_loss']}\n"
         f"目標：{r['target']}\n\n"
-        f"判斷：{r['status']}"
+        f"判斷：{r['status']}\n\n"
+        f"📌 進出場建議\n"
+        f"{buy_advice(r)}\n\n"
+        f"圖表：綠箭頭=觀察買點｜紅線=突破前高｜黑線=停損｜綠線=目標"
     )
 
 
@@ -416,31 +447,39 @@ def scan_market(all_stocks):
     if today not in notified:
         notified = {today: []}
 
-    found = 0
+    candidates = []
 
     for stock in all_stocks:
         try:
             r = analyze_intraday(stock)
 
             if r and r["is_signal"] and stock not in notified[today]:
-                chart = plot_chart(stock, r)
-                message = format_intraday_signal(r)
-
-                if chart:
-                    send_photo(message, chart)
-                else:
-                    send_message(message)
-
-                notified[today].append(stock)
-                found += 1
+                candidates.append(r)
 
         except Exception as e:
             print(stock, e)
 
+    candidates = sorted(candidates, key=lambda x: x["score"], reverse=True)[:MAX_PUSH_SIGNALS]
+
+    for r in candidates:
+        try:
+            chart = plot_intraday_chart(r["symbol"], r)
+            message = format_intraday_signal(r)
+
+            if chart:
+                send_photo(message, chart)
+            else:
+                send_message(message)
+
+            notified[today].append(r["symbol"])
+
+        except Exception as e:
+            print("推播失敗：", e)
+
     save_notified(notified)
 
     now = datetime.now().strftime("%Y-%m-%d %H:%M")
-    print(f"{now} 掃描完成，新訊號：{found}")
+    print(f"{now} 掃描完成，新訊號：{len(candidates)}")
 
 
 def send_my_stocks_report():
@@ -458,15 +497,42 @@ def send_my_stocks_report():
     send_message(msg)
 
 
+def send_top10(all_stocks):
+    results = []
+
+    for stock in all_stocks[:MAX_SCAN_STOCKS]:
+        try:
+            r = analyze_daily(stock)
+            if r:
+                results.append(r)
+        except Exception as e:
+            print(stock, e)
+
+    results = sorted(results, key=lambda x: x["score"], reverse=True)[:10]
+
+    msg = "🏆 今日強勢股票 TOP10\n\n"
+
+    for i, r in enumerate(results, start=1):
+        msg += (
+            f"{i}. {r['symbol']}｜{r['score']}分｜現價 {r['close']}\n"
+            f"判斷：{r['status']}\n\n"
+        )
+
+    send_message(msg)
+
+
 def main():
     send_message(
-        "🔥 整合最終版已啟動\n\n"
-        "你可以傳股票代號，例如：2330、3023、3105\n"
-        "系統也會在盤中自動掃描買點。"
+        "🔥 終極版 Bot 已啟動\n\n"
+        "可用指令：\n"
+        "2330 = 查股票分析 + 進出場圖\n"
+        "/my = 我的股票監控\n"
+        "/scan = 手動掃市場買點\n"
+        "/top = 今日強勢股 TOP10"
     )
 
     if SCAN_ALL_MARKET:
-        all_stocks = get_all_tw_stocks()
+        all_stocks = get_all_tw_stocks()[:MAX_SCAN_STOCKS]
     else:
         all_stocks = my_stocks
 
@@ -476,14 +542,11 @@ def main():
 
     while True:
         try:
-            # ===== 接收你傳的股票代號 =====
             updates = get_updates(offset)
 
             for update in updates.get("result", []):
                 offset = update["update_id"] + 1
-
-                message = update.get("message", {})
-                text = message.get("text", "")
+                text = update.get("message", {}).get("text", "")
 
                 if not text:
                     continue
@@ -493,19 +556,27 @@ def main():
                     continue
 
                 if text == "/scan":
-                    send_message("開始手動掃描市場...")
+                    send_message("開始手動掃描市場買點...")
                     scan_market(all_stocks)
                     continue
 
-                symbol = convert_symbol(text)
-                result = analyze_daily(symbol)
+                if text == "/top":
+                    send_message("開始計算今日強勢股 TOP10...")
+                    send_top10(all_stocks)
+                    continue
 
-                if result:
-                    send_message(format_daily_analysis(result))
+                symbol = convert_symbol(text)
+                r = analyze_daily(symbol)
+
+                if r:
+                    chart = plot_chart(symbol, r)
+                    if chart:
+                        send_photo(format_daily_analysis(r), chart)
+                    else:
+                        send_message(format_daily_analysis(r))
                 else:
                     send_message(f"找不到資料：{symbol}")
 
-            # ===== 每天自動回報你的股票 =====
             today = datetime.now().strftime("%Y-%m-%d")
             now_time = datetime.now().time()
 
@@ -513,7 +584,6 @@ def main():
                 send_my_stocks_report()
                 last_report_date = today
 
-            # ===== 盤中每5分鐘自動掃描 =====
             if is_market_time():
                 now_ts = time.time()
 
